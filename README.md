@@ -1,15 +1,18 @@
 # Edge QC Classifier Inference Service
 
-A FastAPI + NumPy inference service for an edge quality-control machine with a
-hard constraint: **the machine can host at most two model processes**. Models
-are replaced online — without dropping accepted inference and without ever
-running a third model process.
+A FastAPI + NumPy inference service for an edge quality-control machine with
+two hard constraints:
+
+1. **the machine can host at most two model processes**, and models are
+   replaced online without dropping accepted inference;
+2. **several QC stations share the compute**, so only one inference runs at a
+   time globally and one device cannot monopolise the service.
 
 ```
-POST /infer           classify a feature vector (with optional client timeout)
+POST /infer           classify a feature vector (optional device_id / timeout)
 POST /admin/models    upload weights/bias/labels and hot-swap the model in
 GET  /admin/versions  version registry
-GET  /admin/status    active version, in-flight counts, per-process state
+GET  /admin/status    per-version pending/in-flight counts, device queues, slots
 GET  /healthz         liveness
 GET  /docs            Swagger UI (interactive; shows every field)
 ```
@@ -66,6 +69,57 @@ else is rejected with 422 before a process is started.
 | `slow_load_ms` | demo: delay worker readiness to watch the old version serve |
 | `simulate_load_failure` | demo: make the new worker report a load failure |
 
+## Device scheduling
+
+`POST /infer` accepts an optional `device_id` (a QC station). The scheduler in
+`app/scheduler.py` runs in the API process:
+
+```json
+{"features": [0.7, 0.2, 0.1, 0.5], "device_id": "press-3", "timeout_ms": 5000}
+```
+
+| rule | behaviour |
+| --- | --- |
+| missing/blank `device_id` | goes to the `default` queue |
+| ordering inside a device | strict FIFO |
+| ordering across devices | round-robin over non-empty devices |
+| a device that receives work | joins the rotation at its **tail**; it rejoins at the tail after each turn while it still has work |
+| concurrency | **exactly one inference executes globally**; the next item is dispatched only when the previous model call has actually ended (success or error) |
+| queue limit | at most **32** requests may be *pending*; a full queue returns **429** with `Retry-After` |
+| load smoke test | `POST /admin/models` test inference talks to the candidate worker directly, so it does **not** consume a device queue slot or the global execution turn |
+
+Admission binds a request to the **active model version immediately**, before
+it is queued. A request waiting behind other devices keeps using that version
+even if a new version is promoted meanwhile; the registry's *pending* count
+keeps the old process alive until the queued work either runs or expires.
+
+Queue contents live only in the API process, so a restart starts with an empty
+queue.
+
+### Timeouts and disconnects
+
+The clock starts at admission (when the request is accepted and bound to a
+version), not when it starts executing.
+
+| state | deadline expires | client disconnects |
+| --- | --- | --- |
+| **pending** (queued) | removed from its queue, **never executed**, 504 `queue_timeout`; the pending count is released | same: removed, never executed |
+| **dispatched** (executing) | 504 `inference_timeout`; the shielded model call keeps running, keeps its device's turn and its in-flight count | request runs to completion; the slot is **not** released early |
+
+Only when the model call actually returns (or raises) does the in-flight
+count drop and the next item get dispatched. This is what guarantees a second
+device cannot start while the first model process is still busy, and that a
+retired process is never stopped mid-computation.
+
+### Status
+
+`GET /admin/status` reports, **per version**, `pending` (admitted, queued) and
+`in_flight` (actually executing), plus lifetime `accepted`/`completed` counts
+(these survive the version's slot being reused). It also lists each device
+queue (`devices`) and scheduler counters
+(`scheduler`). Queued work and slow inference do not block swaps or this
+endpoint.
+
 ## The guarantees and how they are enforced
 
 Each version runs in **its own OS process** (`python -m app.worker_launcher`,
@@ -81,27 +135,34 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 
 * **At most two model processes.** A slot is reserved only when it is `idle`.
   It becomes `idle` only after the worker's OS process has exited *and* the
-  slot's in-flight counter is zero. A `loading` candidate and the `active`
-  version both occupy slots, so a third load gets 429 while a swap is in
-  progress. The API refuses to start twice against the same data directory
-  (file lock), so there is only ever one budget owner.
+  slot's pending and in-flight counters are zero. A `loading` candidate and
+  the `active` version both occupy slots, so a third load gets 429 while a
+  swap is in progress. The API refuses to start twice against the same data
+  directory (file lock), so there is only ever one budget owner.
 * **The old version serves during load.** Promotion is one atomic registry
   operation (`commit_swap`) performed only after the candidate answers a
   smoke-test inference. Until then traffic goes to the old process. A failed
   load or smoke test stops the candidate, frees its slot, and returns 502 with
   `fallback_version` = the still-active old version.
-* **Accepted inference is pinned to its version.** `accept_work` reads the
-  active version *and* increments that slot's in-flight counter in one lock.
-  The returned version is used for the whole request. A swap commits
-  afterwards, the request still executes on the process it was accepted for.
-* **Timeouts do not end the work.** `timeout_ms` (or its seconds alias
+* **Accepted inference is pinned to its version.** `admit_work` reads the
+  active version *and* increments that slot's pending counter in one lock.
+  The returned version is used for the whole request, including while it sits
+  in the device queue. A swap that commits afterwards cannot move it.
+* **Queued work holds the process too.** The drain gate waits for
+  `pending + in_flight == 0`. A queued request keeps its bound version's
+  process alive, so after a swap the old version remains `draining` until its
+  queue has run or expired.
+* **Timeouts do not end dispatched work.** `timeout_ms` (or its seconds alias
   `timeout_seconds`, or the API's default) bounds only how long the caller
-  waits. On expiry the client gets 504, but the worker call runs in a task
-  shielded from the request timeout/cancellation, and the in-flight counter is
-  decremented when the worker actually returns. A disconnected client behaves
-  the same way.
+  waits. On expiry while executing the client gets 504, but the worker call
+  runs shielded from the request timeout/cancellation, and the in-flight
+  counter is decremented when the worker actually returns. A disconnected
+  client behaves the same way.
+* **Queued work that expires never runs.** Removal from the queue and the
+  registry pending decrement happen together; the scheduler never dispatches
+  a job past its admission deadline.
 * **The old process exits only after real work ends.** The drain loop stops and
-  reaps a `draining` process only when its in-flight count is zero. Just after
+  reaps a `draining` process only when its unfinished count is zero. Just after
   a 504 you will see the old version `draining` with `in_flight: 1`; the slot
   is not reusable yet.
 * **A full machine refuses the third version, without touching the current
@@ -118,19 +179,26 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 
 ## Demo scenarios
 
-1. **Normal swap.** Upload `examples/models/v1.json`, infer, upload `v2`,
+`python examples/demo.py <base-url>` runs all of these end to end.
+
+1. **Multi-device round-robin.** Five requests each from `press-1`,
+   `press-2` and `press-3` with `slow_ms`; the completion order shows one
+   device at a time and round-robin between non-empty devices (not FIFO by
+   arrival across devices).
+2. **Normal swap.** Upload `examples/models/v1.json`, infer, upload `v2`,
    infer. `/admin/status` shows the previous version `draining` then `idle`.
-2. **Load failure.** Upload with `"simulate_load_failure": true` (or send an
+3. **Load failure.** Upload with `"simulate_load_failure": true` (or send an
    inconsistent artifact). You get 502/422; the old version keeps answering,
    and the candidate's slot is immediately free again.
-3. **Slow inference + timeout + capacity.** `POST /infer` with
+4. **Slow inference + timeout + capacity.** `POST /infer` with
    `{"features": [...], "slow_ms": 6000, "timeout_ms": 150}`. You get 504.
    `/admin/status` still shows `in_flight: 1`. Upload a new version — it
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
-
-`python examples/demo.py <base-url>` runs all three end to end.
+5. **Queued expiry.** Hold the executor with a slow request, then send another
+   request from a different device with a short `timeout_ms`. It returns 504
+   `queue_timeout` without ever running; the status `pending` count drops.
 
 ## Observations from the smoke runs
 
@@ -138,8 +206,16 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   itself is microseconds; this includes HTTP round trips).
 - After a 504, the drain gate held the slot for the full remaining computation
   (verified: 429 until the slow request finished, then `idle`).
-- SIGTERM with an in-flight request: the request completed with 200, the API
-  exited 0/-15 cleanly, and no worker processes remained.
+- With 3 concurrent requests from one device at `slow_ms=400`, the three
+  completions took ~370/670/980 ms: strictly serialized, FIFO.
+- Round-robin with devices A/B/C × 2 items each at `slow_ms=400` produced
+  queue waits of roughly 0/400/800 for the first round and 1200/1600/2000 for
+  the second — alternating devices, not draining one device first.
+- A burst of 45 concurrent requests produced `429`s once 32 were pending, and
+  the queue drained to zero afterwards.
+- SIGTERM with an in-flight request: the request completed with 200, queued
+  work was released unexecuted, the API exited cleanly, and no worker
+  processes remained.
 
 ## Layout
 
@@ -147,12 +223,14 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 app/
   main.py             API, swap orchestration, drain loop, status
   process_manager.py  shared registry/state machine + worker process handles
-  worker.py           per-versionHTTP server (one process per version)
+  scheduler.py        per-device FIFO queues, round-robin, single executor
+  worker.py           per-version HTTP server (one process per version)
   worker_launcher.py  process entry point: load artifact, bind, serve, handshake
   models.py           artifact validation, NumPy scoring
 tests/
   test_models.py          artifact validation + scoring
-  test_registry.py        state machine, claims, drain gate, crash reclaim
+  test_registry.py        state machine, pending/in-flight, claims, drain gate
+  test_scheduler.py       round-robin, FIFO, capacity, cancellation
   test_api_integration.py real API + real worker processes
 examples/
   demo.py, models/*.json
@@ -164,6 +242,7 @@ examples/
 | --- | --- | --- |
 | `DATA_DIR` | `/data` | models, staging, worker control dirs, instance lock |
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
+| `MAX_PENDING_REQUESTS` | `32` | maximum admitted-but-unexecuted requests across all devices; beyond it `/infer` returns 429 |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |

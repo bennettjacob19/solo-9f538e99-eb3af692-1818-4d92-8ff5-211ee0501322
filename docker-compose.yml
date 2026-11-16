@@ -8,6 +8,9 @@ services:
     environment:
       DATA_DIR: /data
       DEFAULT_INFER_TIMEOUT_MS: "5000"
+      # Maximum admitted-but-not-yet-executed requests across all devices.
+      # A full queue makes POST /infer return 429.
+      MAX_PENDING_REQUESTS: "32"
       # A draining version is allowed to delay the next upload this long
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"

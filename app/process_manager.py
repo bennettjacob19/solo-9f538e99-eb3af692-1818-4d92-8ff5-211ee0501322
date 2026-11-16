@@ -18,14 +18,21 @@ Rules encoded here:
   finished.  Until then the slot is occupied, so a third load is refused.
 * A slot holding a ``loading`` candidate and a slot holding the ``active``
   version are both occupied; only ``idle`` slots can be reserved.
-* ``accept_work`` reads the active version and increments that slot's
-  in-flight counter in one locked operation.  The returned version is the
-  version the request must use, so an accepted request can never be moved to a
-  different model by a swap that commits immediately afterwards.
+* ``admit_work`` reads the active version and increments that slot's
+  *pending* counter in one locked operation.  The returned version is the
+  version the request must use, so an admitted request can never be moved to
+  a different model by a swap that commits immediately afterwards.  Pending
+  work is queued by the device scheduler and is deliberately **not** counted
+  as in-flight: it has been accepted, but no model process is busy with it.
+* ``dispatch_work`` moves one pending request to in-flight in one locked
+  operation, so there is no instant at which a version with work held by the
+  scheduler shows both counters at zero (which would let the drain loop stop
+  its process).
 * ``commit_swap`` atomically promotes the tested candidate and moves the old
   version to ``draining``.  The old process is stopped only by the drain
-  coordinator after ``in_flight == 0``; only after the OS process exits is
-  ``release_slot`` allowed.
+  coordinator after both ``pending == 0`` and ``in_flight == 0``; queued
+  requests stay bound to that process until they have actually run (or have
+  expired).  Only after the OS process exits is ``release_slot`` allowed.
 * ``begin_swap`` claims a swap *keyed by the old active version*.  A second
   swap claiming the same old version while the first is still in progress is
   rejected before any process is started.  The API runs as a single process
@@ -98,6 +105,7 @@ class Registry:
                 "version": None,
                 "process_state": STATE_IDLE,
                 "pid": None,
+                "pending": 0,
                 "in_flight": 0,
                 "accepted": 0,
                 "completed": 0,
@@ -111,8 +119,15 @@ class Registry:
     # ------------------------------------------------------------------
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            versions = {k: dict(v) for k, v in self._versions.items()}
             slots = {k: dict(v) for k, v in self._slots.items()}
+            versions: Dict[str, Dict[str, Any]] = {}
+            for key, value in self._versions.items():
+                info = dict(value)
+                slot = slots.get(info.get("slot_id"))
+                owns_slot = slot is not None and slot["version"] == key
+                info["pending"] = int(slot["pending"]) if owns_slot else 0
+                info["in_flight"] = int(slot["in_flight"]) if owns_slot else 0
+                versions[key] = info
             return {
                 "active_version": self._state["active_version"],
                 "capacity": SLOT_COUNT,
@@ -134,6 +149,7 @@ class Registry:
             return dict(info) if info is not None else None
 
     def version_in_flight(self, version: str) -> int:
+        """Work actually running inside the version's process."""
         with self._lock:
             info = self._versions.get(version)
             if info is None:
@@ -142,6 +158,28 @@ class Registry:
             if slot is None or slot["version"] != version:
                 return 0
             return int(slot["in_flight"])
+
+    def version_pending(self, version: str) -> int:
+        """Work admitted for the version's process but not yet dispatched."""
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return 0
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                return 0
+            return int(slot["pending"])
+
+    def version_unfinished(self, version: str) -> int:
+        """Queued plus running work; both keep a retiring process alive."""
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return 0
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                return 0
+            return int(slot["pending"]) + int(slot["in_flight"])
 
     def has_capacity(self) -> bool:
         with self._lock:
@@ -224,6 +262,7 @@ class Registry:
                 version=version,
                 process_state=STATE_LOADING,
                 pid=None,
+                pending=0,
                 in_flight=0,
                 accepted=0,
                 completed=0,
@@ -245,6 +284,11 @@ class Registry:
                 "error": None,
                 "attempt": attempt,
                 "previous_error": previous_error,
+                # Lifetime counters for this version, independent of slot reuse
+                # (the slot's own counters reset when it is handed to a new
+                # version; these do not).
+                "accepted": 0,
+                "completed": 0,
             }
             return slot_id
 
@@ -303,6 +347,7 @@ class Registry:
                     version=None,
                     process_state=STATE_IDLE,
                     pid=None,
+                    pending=0,
                     in_flight=0,
                     idle_since=time.time(),
                 )
@@ -358,12 +403,18 @@ class Registry:
             self._state["active_version"] = version
             del self._claims[key]
 
-    def accept_work(self, n_features: Optional[int] = None) -> Tuple[str, str]:
-        """Pin an inference to the active version and count it in-flight.
+    def admit_work(self, n_features: Optional[int] = None) -> Tuple[str, str]:
+        """Pin an inference to the active version and count it as pending.
+
+        Admission is the point at which the request binds to a model version;
+        a swap that commits from now on cannot move it to another version.
+        The request is *queued*, so only the pending counter moves -- not the
+        in-flight counter, which is reserved for work actually running inside
+        the model process.
 
         With ``n_features`` the request is validated against the active
         version's input width inside the same critical section, so a rejected
-        request never touches the in-flight counter.
+        request never touches the counters.
         """
         with self._lock:
             version = self._state["active_version"]
@@ -391,10 +442,47 @@ class Registry:
             ):
                 raise NoActiveModel("active slot is inconsistent")
             slot = dict(slot)
-            slot["in_flight"] += 1
+            slot["pending"] += 1
             slot["accepted"] += 1
             self._slots[info["slot_id"]] = slot
+            info = dict(info)
+            info["accepted"] = int(info.get("accepted", 0)) + 1
+            self._versions[version] = info
             return version, info["slot_id"]
+
+    def dispatch_work(self, version: str) -> bool:
+        """Move one pending request for ``version`` to in-flight.
+
+        Atomic, so the drain gate never observes a moment where the version
+        has work queued by the scheduler but nothing counted.  Returns False
+        if the request is no longer pending (e.g. it was cancelled).
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return False
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version or slot["pending"] <= 0:
+                return False
+            slot = dict(slot)
+            slot["pending"] -= 1
+            slot["in_flight"] += 1
+            self._slots[info["slot_id"]] = slot
+            return True
+
+    def cancel_pending(self, version: str) -> bool:
+        """Drop one queued request that will never be executed."""
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                return False
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version or slot["pending"] <= 0:
+                return False
+            slot = dict(slot)
+            slot["pending"] -= 1
+            self._slots[info["slot_id"]] = slot
+            return True
 
     def complete_work(self, version: str) -> None:
         with self._lock:
@@ -408,6 +496,9 @@ class Registry:
             slot["in_flight"] = max(0, slot["in_flight"] - 1)
             slot["completed"] += 1
             self._slots[info["slot_id"]] = slot
+            info = dict(info)
+            info["completed"] = int(info.get("completed", 0)) + 1
+            self._versions[version] = info
 
     def release_slot(self, slot_id: str, version: str, process_exited: bool) -> bool:
         """Free a drained slot.
@@ -421,7 +512,7 @@ class Registry:
             slot = self._slots.get(slot_id)
             if slot is None or slot["version"] != version:
                 return False
-            if slot["in_flight"] != 0:
+            if slot["in_flight"] != 0 or slot["pending"] != 0:
                 return False
             if slot["process_state"] not in (STATE_DRAINING, STATE_LOADING):
                 return False
@@ -452,7 +543,12 @@ class Registry:
             if info is None or info["state"] != VERSION_ACTIVE:
                 return False
             slot = self._slots.get(info["slot_id"])
-            if slot is None or slot["version"] != version or slot["in_flight"] != 0:
+            if (
+                slot is None
+                or slot["version"] != version
+                or slot["in_flight"] != 0
+                or slot["pending"] != 0
+            ):
                 return False
             info = dict(info)
             info.update(state=VERSION_FAILED, error=error, retired_at=time.time())
@@ -462,6 +558,7 @@ class Registry:
                 version=None,
                 process_state=STATE_IDLE,
                 pid=None,
+                pending=0,
                 in_flight=0,
                 idle_since=time.time(),
             )
@@ -484,11 +581,12 @@ class Registry:
             slot = self._slots.get(info["slot_id"])
             if slot is None or slot["version"] != version:
                 return False
-            if slot["in_flight"] == 0:
+            if slot["in_flight"] == 0 and slot["pending"] == 0:
                 return False
             slot = dict(slot)
-            slot["completed"] += slot["in_flight"]
+            slot["completed"] += slot["in_flight"] + slot["pending"]
             slot["in_flight"] = 0
+            slot["pending"] = 0
             self._slots[info["slot_id"]] = slot
             return True
 

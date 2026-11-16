@@ -2,17 +2,23 @@
 
 Public surface (see ``/docs``):
 
-* ``POST /infer``            -- classify a feature vector with a client timeout
+* ``POST /infer``            -- queue a feature vector for a device, then classify
 * ``POST /admin/models``     -- upload a classifier artifact and hot-swap it in
 * ``GET  /admin/versions``   -- version registry
-* ``GET  /admin/status``     -- active version, in-flight counts, process states
+* ``GET  /admin/status``     -- per-version pending/in-flight counts, device queues
 * ``GET  /healthz``          -- liveness
 
 The invariants live in ``app/process_manager.py``.  In short: every model
 version runs in its own OS process, at most two such processes exist at once,
 requests are pinned to the version active at admission, and a retired version
-only releases its slot once every inference it actually accepted has finished
-inside its worker -- regardless of whether the client is still waiting.
+only releases its slot once every inference it accepted has finished inside
+its worker -- regardless of whether the client is still waiting.
+
+Device fair queueing lives in ``app/scheduler.py``: each ``device_id`` has a
+FIFO queue, non-empty devices rotate round-robin, a device that gets work joins
+at the tail of the rotation, and exactly one inference executes globally.
+Requests wait up to ``MAX_PENDING_REQUESTS`` (default 32) in the pending queue;
+beyond that ``POST /infer`` returns 429.
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
@@ -48,6 +55,15 @@ from app.process_manager import (
     SwapConflict,
     WorkerHandle,
 )
+from app.scheduler import (
+    DEVICE_DEFAULT,
+    Job,
+    JobDropped,
+    QueueFull,
+    QueueTimeout,
+    ServiceStopping,
+    DeviceScheduler,
+)
 
 logger = logging.getLogger("qc.service")
 logging.basicConfig(
@@ -62,6 +78,8 @@ STAGING_DIR = DATA_DIR / "staging"
 WORK_DIR = DATA_DIR / "workers"
 DEFAULT_TIMEOUT_MS = int(os.environ.get("DEFAULT_INFER_TIMEOUT_MS", "5000"))
 MAX_TIMEOUT_MS = 600_000
+# Maximum number of admitted-but-not-yet-executing requests across all devices.
+MAX_PENDING_REQUESTS = int(os.environ.get("MAX_PENDING_REQUESTS", "32"))
 # How long an upload may wait for a draining slot to be released before 429.
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
@@ -75,13 +93,24 @@ SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
 
 class InferRequest(BaseModel):
     features: List[float] = Field(..., description="Feature vector for the classifier")
+    device_id: Optional[str] = Field(
+        None,
+        max_length=64,
+        description=(
+            "QC station sharing this service. Requests from one device are "
+            "executed first-in-first-out; different devices take turns. "
+            "Omitted or empty means the `default` queue."
+        ),
+    )
     timeout_ms: Optional[int] = Field(
         None,
         ge=1,
         le=MAX_TIMEOUT_MS,
         description=(
-            "How long the client is willing to wait, in milliseconds. On expiry the "
-            "API returns 504; the model process keeps computing to completion."
+            "How long the client is willing to wait from the moment the request "
+            "is accepted, in milliseconds. A queued request that expires is "
+            "removed without being executed; a dispatched one returns 504 while "
+            "the model process keeps computing."
         ),
     )
     timeout_seconds: Optional[float] = Field(
@@ -117,7 +146,45 @@ class InferResponse(BaseModel):
     label: str
     score: float
     inference_id: str
+    device_id: str
     elapsed_ms: float
+    queue_wait_ms: float
+
+
+class DeviceQueueView(BaseModel):
+    device_id: str
+    pending: int
+    executing: bool
+
+
+class SchedulerView(BaseModel):
+    max_pending: int
+    pending: int
+    executing_device: Optional[str]
+    admitted_total: int
+    executed_total: int
+    completed_total: int
+    failed_total: int
+    queued_timeouts_total: int
+    queued_dropped_total: int
+
+
+class VersionCountView(BaseModel):
+    version: str
+    state: str
+    process_state: str
+    slot_id: str
+    pid: Optional[int]
+    pending: int
+    in_flight: int
+    accepted: int
+    completed: int
+    created_at: float
+    tested_at: Optional[float]
+    activated_at: Optional[float]
+    retired_at: Optional[float]
+    error: Optional[str]
+    attempt: int
 
 
 class TimeoutResponse(BaseModel):
@@ -158,6 +225,7 @@ class SlotView(BaseModel):
     version: Optional[str]
     process_state: str
     pid: Optional[int]
+    pending: int
     in_flight: int
     accepted: int
     completed: int
@@ -167,13 +235,16 @@ class SlotView(BaseModel):
 class StatusView(BaseModel):
     active_version: Optional[str]
     version: Optional[str]
+    total_pending: int
     total_in_flight: int
     total_accepted: int
     total_completed: int
     slots_in_use: int
     capacity: int
     slots: List[SlotView]
-    versions: List[Dict[str, Any]]
+    versions: List[VersionCountView]
+    devices: List[DeviceQueueView]
+    scheduler: SchedulerView
 
 
 class SwapResult(BaseModel):
@@ -197,12 +268,13 @@ class InferenceService:
     def __init__(self) -> None:
         self.manager: Any = None
         self.registry: Registry
+        self.scheduler: DeviceScheduler
         self.handles: Dict[str, WorkerHandle] = {}
         self.client: Optional[httpx.AsyncClient] = None
         self._drain_task: Optional[asyncio.Task] = None
         self._closing = False
         self._draining: set[str] = set()
-        self._background: set[asyncio.Task] = set()
+        self._orphaned_waiters: set[asyncio.Future] = set()
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
         self._lock_file: Any = None
 
@@ -225,6 +297,12 @@ class InferenceService:
             ) from exc
         self.manager = _new_manager()
         self.registry = Registry(self.manager)
+        self.scheduler = DeviceScheduler(
+            self.registry,
+            self._execute_job,
+            max_pending=MAX_PENDING_REQUESTS,
+        )
+        self.scheduler.start()
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None),
             limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
@@ -256,17 +334,11 @@ class InferenceService:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._drain_task
             self._drain_task = None
-        # Let accepted inference settle so no in-flight work is killed halfway
-        # and no worker is left orphaned.  Bounded so shutdown cannot hang.
-        if self._background:
-            logger.info("waiting for %d in-flight inference call(s)", len(self._background))
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(*self._background, return_exceptions=True),
-                    timeout=SHUTDOWN_GRACE_SECONDS,
-                )
-        for task in list(self._background):
-            task.cancel()
+        # Release queued work first: those requests were accepted but never
+        # started, so they must not run during shutdown.  A job already
+        # executing is shielded and allowed to settle (bounded) by the
+        # scheduler before workers are stopped below.
+        await self.scheduler.shutdown(grace_seconds=SHUTDOWN_GRACE_SECONDS)
         for handle in list(self.handles.values()):
             await asyncio.to_thread(handle.stop, 5.0)
         self.handles.clear()
@@ -576,9 +648,10 @@ class InferenceService:
                 continue
             if version in self._draining:
                 continue
-            # The drain gate: only stop the process once no accepted request
-            # is still running inside it.
-            if self.registry.version_in_flight(version) > 0:
+            # The drain gate: accepted work keeps the process alive.  Queued
+            # work counts too, because it was bound to this version and must
+            # still execute here if it is dispatched in time.
+            if self.registry.version_unfinished(version) > 0:
                 continue
             self._draining.add(version)
             try:
@@ -610,10 +683,42 @@ class InferenceService:
 
     # -- inference -------------------------------------------------------
     async def infer(
-        self, features: List[float], timeout_ms: int, slow_ms: int = 0
+        self,
+        features: List[float],
+        device_id: Optional[str],
+        timeout_ms: int,
+        slow_ms: int = 0,
+        disconnect: Optional[asyncio.Event] = None,
     ) -> InferResponse:
+        """Admit a request to the active version, queue it, and wait for it.
+
+        The clock starts at admission.  While the job is still *pending* its
+        expiry or a client disconnect removes it unexecuted; once *dispatched*
+        the same events only stop the client waiting -- the shielded executor
+        keeps running, keeps its device's turn and keeps the global execution
+        slot until the model call actually returns.
+        """
+        device = (device_id or "").strip() or DEVICE_DEFAULT
+
+        # Capacity and binding are decided in one event-loop step so that no
+        # other request can slip between the 429 check and enqueueing.
+        if not self.scheduler.has_capacity():
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "queue_full",
+                    "message": (
+                        f"{self.scheduler.pending_count} requests are already "
+                        f"waiting (max {self.scheduler.max_pending})"
+                    ),
+                    "device_id": device,
+                    "max_pending": self.scheduler.max_pending,
+                },
+                headers={"Retry-After": "1"},
+            )
+
         try:
-            version, _slot_id = self.registry.accept_work(len(features))
+            version, _slot_id = self.registry.admit_work(len(features))
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -631,95 +736,280 @@ class InferenceService:
                 detail={"error": "no_active_model", "message": str(exc)},
             ) from exc
 
-        handle = self.handles.get(version)
-        if handle is None:  # pragma: no cover - registry/handle invariant
-            self.registry.complete_work(version)
+        # Admission binds the request to ``version`` for good.  If the worker
+        # is already gone, release the pending count -- it will never run.
+        if self.handles.get(version) is None:  # pragma: no cover - invariant
+            self.registry.cancel_pending(version)
             raise HTTPException(
                 status_code=503,
                 detail={"error": "worker_missing", "message": f"worker for {version} is gone"},
             )
 
-        payload: Dict[str, Any] = {"features": features}
-        if slow_ms:
-            payload["slow_ms"] = slow_ms
-        inference_id = uuid.uuid4().hex
-
-        # Shield the worker call from this request's timeout/cancellation.  The
-        # in-flight counter must only clear when the model process is actually
-        # done; a 504 or disconnected client must not fake completion.
-        task = asyncio.create_task(self._proxy_inference(version, handle, payload))
-        self._background.add(task)
-        task.add_done_callback(self._background.discard)
-
-        started = time.perf_counter()
+        admitted_at = time.monotonic()
+        deadline = admitted_at + timeout_ms / 1000.0
         try:
-            result = await asyncio.wait_for(asyncio.shield(task), timeout_ms / 1000.0)
-        except asyncio.TimeoutError:
-            elapsed = (time.perf_counter() - started) * 1000.0
+            job = self.scheduler.submit(
+                device_id=device,
+                version=version,
+                features=features,
+                slow_ms=slow_ms,
+                admitted_at=admitted_at,
+                deadline=deadline,
+            )
+        except QueueFull as exc:  # pragma: no cover - guarded above
+            self.registry.cancel_pending(version)
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "queue_full",
+                    "message": str(exc),
+                    "device_id": device,
+                    "max_pending": self.scheduler.max_pending,
+                },
+                headers={"Retry-After": "1"},
+            ) from exc
+
+        outcome = await self._await_job(job, disconnect)
+        elapsed = (time.monotonic() - admitted_at) * 1000.0
+        if outcome["kind"] == "result":
+            result = outcome["result"]
+            return InferResponse(
+                version=version,
+                label=result["label"],
+                score=float(result["score"]),
+                inference_id=job.job_id,
+                device_id=device,
+                elapsed_ms=round(elapsed, 3),
+                queue_wait_ms=job.queue_wait_ms,
+            )
+        raise outcome["error"]
+
+    async def _await_job(
+        self, job: Job, disconnect: Optional[asyncio.Event]
+    ) -> Dict[str, Any]:
+        """Wait for ``job`` until it settles, times out, or the client leaves.
+
+        The underlying future is shielded: giving up on waiting never cancels
+        work the scheduler has already dispatched.
+        """
+        wait_task: asyncio.Future = asyncio.ensure_future(asyncio.shield(job.future))
+        disc_task: Optional[asyncio.Task] = (
+            asyncio.ensure_future(disconnect.wait()) if disconnect is not None else None
+        )
+        waiters = {wait_task}
+        if disc_task is not None:
+            waiters.add(disc_task)
+        # Give waiting up no later than the admission deadline.  The tiny
+        # slack lets a model call that ends right at the deadline win the race
+        # so it is reported as a result rather than as a timeout.
+        wait_seconds = job.remaining + 0.02
+        try:
+            done, _ = await asyncio.wait(
+                waiters,
+                timeout=wait_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            # Starlette may cancel the handler on disconnect (or on server
+            # shutdown).  Queued work must never run in that case; dispatched
+            # work is deliberately left alone and shielded.
+            if self.scheduler.cancel_pending(job, reason="dropped"):
+                logger.info(
+                    "dropped queued request %s (device=%s) after handler cancellation",
+                    job.job_id,
+                    job.device_id,
+                )
+            raise
+        finally:
+            if disc_task is not None:
+                disc_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await disc_task
+            # If we stop waiting while the job is still running (timeout or
+            # disconnect), keep a reference to the shielded waiter and drain
+            # its eventual result/exception so asyncio does not warn about an
+            # unretrieved exception.  The job itself is unaffected.
+            if not wait_task.done():
+                self._orphaned_waiters.add(wait_task)
+                wait_task.add_done_callback(self._discard_orphan)
+
+        if wait_task in done:
+            if wait_task.cancelled():  # pragma: no cover - shield invariant
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "service_stopping", "message": "request was abandoned"},
+                )
+            exc = wait_task.exception()
+            if exc is None:
+                return {"kind": "result", "result": wait_task.result()}
+            return {"kind": "error", "error": self._job_error(job, exc)}
+
+        if disc_task is not None and disc_task in done and not wait_task.done():
+            # The client went away.  If the job has not been dispatched, drop
+            # it so it can never run.  If it has, leave it alone: it keeps its
+            # device's turn and the global slot until the model call ends.
+            if self.scheduler.cancel_pending(job, reason="dropped"):
+                logger.info(
+                    "dropped queued request %s (device=%s) after client disconnect",
+                    job.job_id,
+                    job.device_id,
+                )
+                raise HTTPException(
+                    status_code=499,
+                    detail={
+                        "error": "client_disconnected",
+                        "message": "queued request removed before execution",
+                        "device_id": job.device_id,
+                        "version": job.version,
+                    },
+                )
+            logger.info(
+                "client disconnected from dispatched request %s; it keeps running",
+                job.job_id,
+            )
+            raise HTTPException(
+                status_code=499,
+                detail={
+                    "error": "client_disconnected",
+                    "message": "request is already executing and will run to completion",
+                    "device_id": job.device_id,
+                    "version": job.version,
+                },
+            )
+
+        # Neither settled nor disconnected within the admission deadline.
+        if self.scheduler.cancel_pending(job, reason="timeout"):
             logger.warning(
-                "inference on %s exceeded %dms (request %s); worker continues",
-                version,
-                timeout_ms,
-                inference_id,
+                "queued request %s (device=%s) expired after %dms; not executed",
+                job.job_id,
+                job.device_id,
+                job.deadline and int((job.deadline - job.admitted_at) * 1000),
             )
             raise HTTPException(
                 status_code=504,
                 detail={
-                    "error": "inference_timeout",
-                    "version": version,
-                    "timeout_ms": timeout_ms,
-                    "elapsed_ms": round(elapsed, 3),
-                    "note": (
-                        "The client stopped waiting, but the model process continues "
-                        "the computation; its slot is not released until that work "
-                        "actually finishes."
+                    "error": "queue_timeout",
+                    "version": job.version,
+                    "device_id": job.device_id,
+                    "message": (
+                        "request timed out while waiting for its turn; it was "
+                        "removed and never executed"
                     ),
                 },
             )
-        except httpx.HTTPError as exc:
-            raise HTTPException(
+        # Lost the race against dispatch: the model is already working on it.
+        logger.warning(
+            "inference on %s for device %s exceeded its deadline while executing; "
+            "worker continues",
+            job.version,
+            job.device_id,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "inference_timeout",
+                "version": job.version,
+                "device_id": job.device_id,
+                "message": (
+                    "The client stopped waiting, but the model process continues "
+                    "the computation; the next request is not dispatched and the "
+                    "model's in-flight count is not cleared until it finishes."
+                ),
+            },
+        )
+
+    def _discard_orphan(self, future: asyncio.Future) -> None:
+        """Drop an abandoned shielded waiter, retrieving its outcome."""
+        self._orphaned_waiters.discard(future)
+        if not future.cancelled():
+            with contextlib.suppress(Exception):
+                future.exception()
+
+    def _job_error(self, job: Job, exc: BaseException) -> HTTPException:
+        if isinstance(exc, QueueTimeout):
+            return HTTPException(
+                status_code=504,
+                detail={
+                    "error": "queue_timeout",
+                    "version": job.version,
+                    "device_id": job.device_id,
+                    "message": str(exc),
+                },
+            )
+        if isinstance(exc, ServiceStopping):
+            return HTTPException(
+                status_code=503,
+                detail={"error": "service_stopping", "message": str(exc)},
+            )
+        if isinstance(exc, JobDropped):
+            return HTTPException(
+                status_code=502,
+                detail={
+                    "error": "worker_unavailable",
+                    "version": job.version,
+                    "device_id": job.device_id,
+                    "message": str(exc),
+                },
+            )
+        if isinstance(exc, httpx.HTTPError):
+            return HTTPException(
                 status_code=502,
                 detail={
                     "error": "worker_unreachable",
-                    "version": version,
+                    "version": job.version,
                     "message": str(exc),
                 },
-            ) from exc
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail={"error": "worker_error", "version": version, "message": str(exc)},
-            ) from exc
-
-        elapsed = (time.perf_counter() - started) * 1000.0
-        return InferResponse(
-            version=version,
-            label=result["label"],
-            score=float(result["score"]),
-            inference_id=inference_id,
-            elapsed_ms=round(elapsed, 3),
+            )
+        return HTTPException(
+            status_code=502,
+            detail={
+                "error": "worker_error",
+                "version": job.version,
+                "message": str(exc),
+            },
         )
 
-    async def _proxy_inference(
-        self, version: str, handle: WorkerHandle, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _execute_job(self, job: Job) -> Dict[str, Any]:
+        """Run one dispatched job to completion inside its pinned worker.
+
+        The scheduler calls this only after ``Registry.dispatch_work`` moved
+        the job from pending to in-flight.  Completion (success or failure)
+        clears the in-flight count, which is what lets the next job run and
+        what eventually lets a retired process drain.
+        """
+        handle = self.handles.get(job.version)
+        if handle is None:
+            self.registry.complete_work(job.version)
+            raise JobDropped(
+                f"worker for version {job.version!r} is gone; request not executed"
+            )
+        payload: Dict[str, Any] = {"features": job.features}
+        if job.slow_ms:
+            payload["slow_ms"] = job.slow_ms
         try:
             assert self.client is not None
             resp = await self.client.post(handle.inference_url(), json=payload)
             if resp.status_code != 200:
                 raise RuntimeError(
-                    f"worker {version} returned HTTP {resp.status_code}: {resp.text[:300]}"
+                    f"worker {job.version} returned HTTP {resp.status_code}: "
+                    f"{resp.text[:300]}"
                 )
             return resp.json()
         finally:
-            # Runs once, when the worker call actually settles.  This is the
-            # only place a request leaves the drain gate.
-            self.registry.complete_work(version)
+            # Runs exactly once when the model call actually settles -- never
+            # when a client stops waiting.
+            self.registry.complete_work(job.version)
 
     # -- status ----------------------------------------------------------
     def status(self) -> StatusView:
+        """Build the status view.  Call from the event loop.
+
+        The device queues live in the event loop; reading them from the
+        threadpool could race a reassignment mid-iteration.
+        """
         snapshot = self.registry.snapshot()
         slots: List[SlotView] = []
+        total_pending = 0
         total_in_flight = 0
         total_accepted = 0
         total_completed = 0
@@ -727,6 +1017,7 @@ class InferenceService:
         for slot in snapshot["slots"]:
             handle = self.handles.get(slot["version"]) if slot["version"] else None
             alive = handle.alive() if handle is not None else None
+            total_pending += int(slot.get("pending", 0))
             total_in_flight += int(slot["in_flight"])
             total_accepted += int(slot["accepted"])
             total_completed += int(slot["completed"])
@@ -736,24 +1027,57 @@ class InferenceService:
                     version=slot["version"],
                     process_state=slot["process_state"],
                     pid=slot["pid"],
+                    pending=int(slot.get("pending", 0)),
                     in_flight=int(slot["in_flight"]),
                     accepted=int(slot["accepted"]),
                     completed=int(slot["completed"]),
                     alive=alive,
                 )
             )
+        versions = []
+        for info in sorted(
+            snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
+        ):
+            versions.append(
+                VersionCountView(
+                    version=info["version"],
+                    state=info["state"],
+                    process_state=info["process_state"],
+                    slot_id=info["slot_id"],
+                    pid=info.get("pid"),
+                    pending=int(info.get("pending", 0)),
+                    in_flight=int(info.get("in_flight", 0)),
+                    accepted=int(info.get("accepted", 0)),
+                    completed=int(info.get("completed", 0)),
+                    created_at=float(info.get("created_at", 0.0)),
+                    tested_at=info.get("tested_at"),
+                    activated_at=info.get("activated_at"),
+                    retired_at=info.get("retired_at"),
+                    error=info.get("error"),
+                    attempt=int(info.get("attempt", 1)),
+                )
+            )
+        devices = [
+            DeviceQueueView(
+                device_id=d["device_id"],
+                pending=d["pending"],
+                executing=d["executing"],
+            )
+            for d in self.scheduler.snapshot()
+        ]
         return StatusView(
             active_version=active,
             version=active,
+            total_pending=total_pending,
             total_in_flight=total_in_flight,
             total_accepted=total_accepted,
             total_completed=total_completed,
             slots_in_use=snapshot["slots_in_use"],
             capacity=snapshot["capacity"],
             slots=slots,
-            versions=sorted(
-                snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
-            ),
+            versions=versions,
+            devices=devices,
+            scheduler=SchedulerView(**self.scheduler.stats()),
         )
 
 
@@ -798,20 +1122,34 @@ app = FastAPI(
         "version is loaded in a free process, smoke-tested, then promoted. The "
         "old version keeps serving during load and keeps serving if the new one "
         "fails.\n"
-        "* `POST /infer` returns the top-scoring label and the version. Requests "
-        "are pinned to the version active when accepted. `timeout_ms` (or "
-        "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
-        "while the worker keeps working and keeps its slot.\n"
-        "* `GET /admin/status` shows the active version, in-flight counts and each "
-        "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
+        "* `POST /infer` accepts an optional `device_id` (a QC station). Each "
+        "device has a FIFO queue; non-empty devices are served round-robin and "
+        "a device joins at the tail. **One inference executes at a time** "
+        "globally. Omitted `device_id` means the `default` queue. Up to "
+        "`MAX_PENDING_REQUESTS` (32) requests may wait; when full, `POST /infer` "
+        "returns 429.\n"
+        "* Requests are pinned to the version active when *accepted*. Queued "
+        "requests do not count as in-flight but still keep that version's "
+        "process alive, so a replacement loaded afterwards does not affect "
+        "them. `timeout_ms` (or `timeout_seconds`) counts from acceptance: a "
+        "queued request that expires is removed unexecuted (504); a dispatched "
+        "one returns 504 while the worker keeps working, keeps its queue turn "
+        "and keeps its in-flight count.\n"
+        "* `GET /admin/status` shows per-version `pending` and `in_flight` "
+        "counts, the device queues, and each process slot's state (`loading` / "
+        "`active` / `draining` / `idle`).\n\n"
         "**Demos**\n"
-        "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
-        "then watch `/admin/status` and try uploading another version: while the "
-        "drained version still works, only one slot is free.\n"
+        "- Multi-device queueing: send several `POST /infer` calls with different "
+        "`device_id`s and a long `slow_ms`; the label order shows round-robin "
+        "service. `/admin/status` shows each device's pending count and the "
+        "single executing device.\n"
+        "- Queue overflow: send more than 32 concurrent slow requests -> 429.\n"
+        "- Slow inference + swap: `POST /infer` with `slow_ms: 3000`, "
+        "`timeout_ms: 200`; you get 504 and the version stays `in_flight: 1`. "
+        "Upload another version: it becomes active while the old one drains. A "
+        "third upload gets 429 until the slow work actually finishes.\n"
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
-        "weights). You get 502 and the old version remains active.\n"
-        "- Capacity: trigger a slow in-flight request, swap once, then try a third "
-        "upload -> 429 until the slow work finishes and the slot is released."
+        "weights). You get 502 and the old version remains active."
     ),
     lifespan=lifespan,
 )
@@ -827,24 +1165,60 @@ def healthz() -> Dict[str, Any]:
     "/infer",
     response_model=InferResponse,
     responses={
+        429: {
+            "description": (
+                "Pending queue full (MAX_PENDING_REQUESTS, default 32); retry later"
+            )
+        },
         504: {
             "model": TimeoutResponse,
-            "description": "Client timeout; the worker keeps computing and holds its slot.",
+            "description": (
+                "Deadline (measured from admission) expired. Queued: removed "
+                "unexecuted. Dispatched: 504 returned, worker keeps computing "
+                "and holds its slot."
+            ),
         },
-        503: {"description": "No active model"},
+        503: {"description": "No active model, or service shutting down"},
         502: {"description": "Worker unreachable or errored"},
     },
     tags=["inference"],
-    summary="Classify a feature vector",
+    summary="Queue a feature vector for a device and classify it",
 )
-async def infer(req: InferRequest) -> InferResponse:
+async def infer(req: InferRequest, request: Request) -> Any:
     if req.timeout_ms is not None:
         timeout_ms = req.timeout_ms
     elif req.timeout_seconds is not None:
         timeout_ms = max(1, int(round(req.timeout_seconds * 1000)))
     else:
         timeout_ms = DEFAULT_TIMEOUT_MS
-    return await service.infer(req.features, timeout_ms, req.slow_ms)
+
+    # Starlette cancels the handler task when the client disconnects.  A
+    # request that is merely queued must be removed in that case, so watch for
+    # the disconnect explicitly; a dispatched request is shielded instead.
+    disconnected = asyncio.Event()
+
+    async def _watch_disconnect() -> None:
+        while True:
+            if await request.is_disconnected():
+                disconnected.set()
+                return
+            await asyncio.sleep(0.1)
+
+    watcher = asyncio.create_task(_watch_disconnect())
+    try:
+        return await service.infer(
+            req.features, req.device_id, timeout_ms, req.slow_ms, disconnected
+        )
+    except HTTPException as exc:
+        if exc.status_code == 499:
+            # FastAPI would otherwise try to serialise a 499 response to a
+            # client that has already gone away.  Close quietly instead.
+            return JSONResponse(status_code=204, content=None)
+        raise
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher
 
 
 @app.post(
@@ -918,7 +1292,7 @@ def versions() -> Dict[str, Any]:
     "/admin/status",
     response_model=StatusView,
     tags=["admin"],
-    summary="Active version, in-flight counts and process states",
+    summary="Per-version pending/in-flight counts, device queues, process states",
 )
-def status() -> StatusView:
+async def status() -> StatusView:
     return service.status()
