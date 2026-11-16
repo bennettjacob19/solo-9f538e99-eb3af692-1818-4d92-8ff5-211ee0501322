@@ -1,0 +1,37 @@
+services:
+  qc-inference:
+    build: .
+    image: qc-inference:local
+    container_name: qc-inference
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      DEFAULT_INFER_TIMEOUT_MS: "5000"
+      # A draining version is allowed to delay the next upload this long
+      # before the upload is refused with 429.
+      SWAP_WAIT_SECONDS: "3"
+      SHUTDOWN_GRACE_SECONDS: "20"
+      LOG_LEVEL: INFO
+      # Optional: load an existing artifact at startup.
+      # BOOTSTRAP_VERSION: v1
+      # BOOTSTRAP_MODEL: /data/models/v1.json
+    volumes:
+      - qc-data:/data
+    # Model processes are children of the API process; give them time to be
+    # stopped gracefully before a hard kill.
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  qc-data:
